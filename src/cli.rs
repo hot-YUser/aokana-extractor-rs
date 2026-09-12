@@ -5,8 +5,12 @@ use std::path::PathBuf;
 use crate::error::Result;
 
 pub enum Command {
+    /// 拖拽模式：無子命令，只有一個位置參數。
+    /// 與 `Extract` 唯一的差別是失敗時會暫停等按鍵——否則從檔案總管拖進來時，
+    /// 主控台視窗會在錯誤訊息被看到之前就關閉。
+    Drag { path: PathBuf },
+    Extract { path: PathBuf, out: Option<PathBuf> },
     List { dat: PathBuf },
-    Extract { dat: PathBuf, out_dir: PathBuf },
     Help,
     Version,
 }
@@ -20,21 +24,20 @@ pub struct Cli {
 pub const USAGE: &str = "aokana — Aokana (蒼の彼方のフォーリズム) Steam .dat 拆包解密工具
 
 用法：
-  aokana list    <file.dat>
-  aokana extract <file.dat> <out_dir>
+  aokana <path>                      拖拽模式：.dat → 解到同目錄的同名資料夾；
+                                     資料夾 → 遞迴解開其中所有 .dat
+  aokana extract <path> [-o <dir>]   同上，可指定輸出根目錄
+  aokana list <file.dat>             列出內容
 
-  相容用法（等同上游 extract.py）：
-  aokana <file.dat>                → list
-  aokana <file.dat> <out_dir>      → extract
-
-全域選項：
+選項：
+  -o, --out <dir>     輸出根目錄（預設：與 .dat 同目錄）
   -j, --threads <N>   執行緒數，0 表示自動（預設 0）
-  -q, --quiet         不輸出進度
+  -q, --quiet         不顯示進度
   -h, --help
   -V, --version
 ";
 
-/// 手寫解析，支援 `--opt value`、`--opt=value`、`-j8`、`-j 8` 四種形式。
+/// 手寫解析，支援 `--opt value`、`--opt=value`、`-j8`、`-j 8`、`-oout`、`-o out` 四種形式。
 /// 解析失敗時回傳人類可讀的錯誤訊息字串（含 USAGE），由 main 印到 stderr 並以 exit code 2 結束。
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> core::result::Result<Cli, String> {
     let args: Vec<String> = args.into_iter().collect();
@@ -72,6 +75,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> core::result::Result<Cl
                     let v = value_of(&args, &mut i, inline, "--threads")?;
                     raw.threads = Some(parse_threads(&v)?);
                 }
+                "out" => {
+                    let v = value_of(&args, &mut i, inline, "--out")?;
+                    raw.out = Some(v);
+                }
                 "quiet" => {
                     reject_inline("--quiet", inline)?;
                     raw.quiet = true;
@@ -89,7 +96,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> core::result::Result<Cl
             }
             i += 1;
         } else if tok.starts_with('-') && tok.len() > 1 {
-            // 短選項：-j8 / -j 8 / -q / -h / -V。
+            // 短選項：-j8 / -j 8 / -oout / -o out / -q / -h / -V。
             let short = match tok.get(1..2) {
                 Some(s) => s,
                 None => return Err(fail(format!("unknown option: {tok}"))),
@@ -104,6 +111,19 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> core::result::Result<Cl
                         attached.strip_prefix('=').unwrap_or(attached).to_string()
                     };
                     raw.threads = Some(parse_threads(&v)?);
+                    i += 1;
+                }
+                "o" => {
+                    let attached = tok.get(2..).unwrap_or("");
+                    let v = if attached.is_empty() {
+                        next_value(&args, &mut i, "-o")?
+                    } else {
+                        attached.strip_prefix('=').unwrap_or(attached).to_string()
+                    };
+                    if v.is_empty() {
+                        return Err(fail("option -o requires a value"));
+                    }
+                    raw.out = Some(v);
                     i += 1;
                 }
                 "q" => {
@@ -127,7 +147,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> core::result::Result<Cl
                     raw.version = true;
                     i += 1;
                 }
-                // 已移除的 -o / -d 與其他短選項一律走未知選項錯誤。
+                // 已移除的 -d 與其他短選項一律走未知選項錯誤。
                 _ => return Err(fail(format!("unknown option: {tok}"))),
             }
         } else if raw.sub.is_none() && is_subcommand(tok) {
@@ -161,37 +181,38 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> core::result::Result<Cl
     // 為什麼先 clone 子命令：後續分支會搬移 raw 的欄位，
     // 若直接 match raw.sub.as_deref() 會借用 raw 而與搬移衝突。
     let sub = raw.sub.clone();
+    // 為什麼 -o 只認 extract：Drag 沒有輸出根目錄的概念（永遠解到 .dat 旁），
+    // list 也不寫檔；出現在別處一律當未知選項，與 --dry-run 等已移除選項同處理。
+    if raw.out.is_some() && !matches!(sub.as_deref(), Some("extract")) {
+        return Err(fail("unknown option: -o/--out is only valid with `extract`"));
+    }
     let command = match sub.as_deref() {
         None => {
-            // 相容用法（等同上游 extract.py）：沒有子命令時以位置參數個數分派。
-            // 為什麼要求 .dat 後綴：相容用法的本意就是直接吃 .dat 檔；
-            // 首參數不是 .dat 時極可能是打錯的子命令，不該靜默當 list 跑。
-            if let Some(first) = raw.positionals.first() {
-                let is_dat = std::path::Path::new(first)
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .map(|e| e.eq_ignore_ascii_case("dat"))
-                    .unwrap_or(false);
-                if !is_dat {
-                    return Err(fail(format!("unknown subcommand: {first}")));
-                }
-            }
+            // 拖拽模式：無子命令、只有一個位置參數。檔案或資料夾皆可，
+            // 不檢查副檔名（資料夾本來就沒有副檔名）；舊版「等同 list」行為已取消。
             match raw.positionals.len() {
                 0 => return Err(fail("missing arguments")),
                 1 => {
-                    let dat = position_at(&raw, 0, "<file.dat>")?;
-                    Command::List { dat }
-                }
-                2 => {
-                    let dat = position_at(&raw, 0, "<file.dat>")?;
-                    let out_dir = position_at(&raw, 1, "<out_dir>")?;
-                    Command::Extract { dat, out_dir }
+                    let path = position_at(&raw, 0, "<path>")?;
+                    Command::Drag { path }
                 }
                 _ => {
+                    // 為什麼保留子命令拼錯提示：首參數不像 .dat 時極可能是打錯的子命令
+                    //（舊行為）；資料夾拖拽只會有一個參數，走不到這裡，不受影響。
+                    if let Some(first) = raw.positionals.first() {
+                        let is_dat = std::path::Path::new(first)
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .map(|e| e.eq_ignore_ascii_case("dat"))
+                            .unwrap_or(false);
+                        if !is_dat {
+                            return Err(fail(format!("unknown subcommand: {first}")));
+                        }
+                    }
                     return Err(fail(format!(
-                        "too many arguments: expected at most 2, got {}",
+                        "too many arguments: expected 1, got {}",
                         raw.positionals.len()
-                    )))
+                    )));
                 }
             }
         }
@@ -202,10 +223,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> core::result::Result<Cl
             }
         }
         Some("extract") => {
-            require_positionals(&raw, 2, "aokana extract <file.dat> <out_dir>")?;
+            require_positionals(&raw, 1, "aokana extract <path> [-o <dir>]")?;
             Command::Extract {
-                dat: position_at(&raw, 0, "<file.dat>")?,
-                out_dir: position_at(&raw, 1, "<out_dir>")?,
+                path: position_at(&raw, 0, "<path>")?,
+                out: raw.out.map(PathBuf::from),
             }
         }
         Some(other) => return Err(fail(format!("unknown subcommand: {other}"))),
@@ -218,8 +239,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> core::result::Result<Cl
 }
 
 /// 分派子命令。`Help` / `Version` 寫到 `out`。
+/// `Drag` / `Extract` 解包成功且非 quiet 時印出一行摘要（§5.4）。
 pub fn run(cli: Cli, out: &mut impl std::io::Write, _err: &mut impl std::io::Write) -> Result<()> {
-    // 為什麼 run 不自己印統計：抽取的進度輸出已由 extract 負責；這裡只做分派，保持薄殼。
     match cli.command {
         Command::Help => {
             out.write_all(USAGE.as_bytes())?;
@@ -234,16 +255,86 @@ pub fn run(cli: Cli, out: &mut impl std::io::Write, _err: &mut impl std::io::Wri
             let d = crate::dat::DatFile::open(&dat)?;
             crate::extract::list(&d, out)
         }
-        Command::Extract { dat, out_dir } => {
-            let d = crate::dat::DatFile::open(&dat)?;
+        Command::Drag { path } => {
             let opts = crate::extract::Options {
                 threads: cli.threads,
                 quiet: cli.quiet,
             };
-            let _ = crate::extract::extract(&d, &out_dir, &opts)?;
+            let stats = crate::extract::run(&path, None, &opts)?;
+            print_summary(out, cli.quiet, &stats)?;
+            Ok(())
+        }
+        Command::Extract { path, out: root } => {
+            let opts = crate::extract::Options {
+                threads: cli.threads,
+                quiet: cli.quiet,
+            };
+            let stats = crate::extract::run(&path, root.as_deref(), &opts)?;
+            print_summary(out, cli.quiet, &stats)?;
             Ok(())
         }
     }
+}
+
+/// 解包完成後的摘要行（與進度條無關）。`-q` 時連這行也不印。
+fn print_summary(
+    w: &mut impl std::io::Write,
+    quiet: bool,
+    s: &crate::extract::Stats,
+) -> Result<()> {
+    // 為什麼摘要與終端機無關：重導向時進度條停用，但摘要仍是機器可讀的一行結論。
+    if !quiet {
+        if s.skipped == 0 {
+            writeln!(
+                w,
+                "已解包 {} 個 .dat、{} 個檔案、{}，耗時 {} 秒",
+                s.dats,
+                s.files,
+                format_bytes(s.bytes),
+                format_secs(s.elapsed),
+            )?;
+        } else {
+            // 有略過才補尾段：零略過時輸出與以往逐字相同。
+            writeln!(
+                w,
+                "已解包 {} 個 .dat、{} 個檔案、{}，耗時 {} 秒（略過 {} 個無法讀取的 .dat）",
+                s.dats,
+                s.files,
+                format_bytes(s.bytes),
+                format_secs(s.elapsed),
+                s.skipped,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// 位元組格式化（與進度條同規則）：1024 進位，G/M/K 取一位小數並去尾 ".0"，B 取整數。
+fn format_bytes(n: u64) -> String {
+    const K: u64 = 1024;
+    const M: u64 = 1024 * 1024;
+    const G: u64 = 1024 * 1024 * 1024;
+    if n >= G {
+        trim1(n as f64 / G as f64, "G")
+    } else if n >= M {
+        trim1(n as f64 / M as f64, "M")
+    } else if n >= K {
+        trim1(n as f64 / K as f64, "K")
+    } else {
+        format!("{n}B")
+    }
+}
+
+fn trim1(v: f64, unit: &str) -> String {
+    // 為什麼去尾 ".0"：整數倍時 "1M" 比 "1.0M" 好讀，與規格範例一致。
+    let s = format!("{v:.1}");
+    let s = s.strip_suffix(".0").unwrap_or(&s);
+    format!("{s}{unit}")
+}
+
+/// 耗時取一位小數的秒數，例如 6.1。
+fn format_secs(d: std::time::Duration) -> String {
+    format!("{:.1}", d.as_secs_f64())
 }
 
 #[derive(Default)]
@@ -252,6 +343,7 @@ struct Raw {
     quiet: bool,
     help: bool,
     version: bool,
+    out: Option<String>,
     sub: Option<String>,
     positionals: Vec<String>,
 }
@@ -360,6 +452,103 @@ mod tests {
         }
     }
 
+    fn drag_path(cli: &Cli) -> &PathBuf {
+        match &cli.command {
+            Command::Drag { path } => path,
+            _ => panic!("invariant: expected Drag command"),
+        }
+    }
+
+    #[test]
+    fn drag_single_dat() {
+        let cli = must_ok(&["a.dat"]);
+        assert_eq!(drag_path(&cli), &PathBuf::from("a.dat"));
+        assert_eq!(cli.threads, 0);
+        assert!(!cli.quiet);
+    }
+
+    #[test]
+    fn drag_accepts_folder_without_dat_extension() {
+        // 資料夾本來就沒有副檔名：拖拽模式不檢查副檔名。
+        let cli = must_ok(&["somedir"]);
+        assert_eq!(drag_path(&cli), &PathBuf::from("somedir"));
+    }
+
+    #[test]
+    fn drag_missing_arguments() {
+        let err = must_err(&[]);
+        assert!(err.contains("missing"), "{err}");
+        assert!(err.contains("用法"), "{err}");
+    }
+
+    #[test]
+    fn drag_two_positionals_fail() {
+        // 舊相容用法 `aokana <file.dat> <out>` 已取消：無子命令只接受一個位置參數。
+        let err = must_err(&["a.dat", "out"]);
+        assert!(err.contains("too many"), "{err}");
+        assert!(err.contains("用法"), "{err}");
+    }
+
+    #[test]
+    fn drag_with_out_fails_as_unknown_option() {
+        // -o 只在 extract 下有意義，拖拽模式出現要當未知選項。
+        for v in [
+            vec!["a.dat", "-o", "out"],
+            vec!["--out=out", "a.dat"],
+            vec!["a.dat", "--out", "out"],
+            vec!["somedir", "-oout"],
+        ] {
+            let err = must_err(&v);
+            assert!(err.contains("unknown option"), "{v:?}: {err}");
+            assert!(err.contains("用法"), "{v:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn extract_defaults_to_none_out() {
+        let cli = must_ok(&["extract", "a.dat"]);
+        match &cli.command {
+            Command::Extract { path, out } => {
+                assert_eq!(path, &PathBuf::from("a.dat"));
+                assert!(out.is_none());
+            }
+            _ => panic!("invariant: expected Extract command"),
+        }
+    }
+
+    #[test]
+    fn extract_out_forms() {
+        for v in [
+            vec!["extract", "a.dat", "-o", "out"],
+            vec!["extract", "a.dat", "-oout"],
+            vec!["extract", "a.dat", "--out", "out"],
+            vec!["extract", "a.dat", "--out=out"],
+            vec!["-o", "out", "extract", "a.dat"],
+        ] {
+            let cli = must_ok(&v);
+            match &cli.command {
+                Command::Extract { out, .. } => {
+                    assert_eq!(out.as_ref(), Some(&PathBuf::from("out")), "{v:?}")
+                }
+                _ => panic!("invariant: expected Extract command for {v:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn extract_old_two_positional_form_fails() {
+        // 舊 `extract <file.dat> <out_dir>` 已改為 `-o`：第二個位置參數現在是多餘的。
+        let err = must_err(&["extract", "a.dat", "out"]);
+        assert!(err.contains("too many"), "{err}");
+    }
+
+    #[test]
+    fn extract_missing_path_fails() {
+        let err = must_err(&["extract"]);
+        assert!(err.contains("missing"), "{err}");
+        assert!(err.contains("用法"), "{err}");
+    }
+
     #[test]
     fn list_parses() {
         let cli = must_ok(&["list", "a.dat"]);
@@ -369,9 +558,9 @@ mod tests {
     }
 
     #[test]
-    fn extract_parses() {
-        let cli = must_ok(&["extract", "a.dat", "out"]);
-        assert!(matches!(cli.command, Command::Extract { .. }));
+    fn list_with_out_fails_as_unknown_option() {
+        let err = must_err(&["list", "a.dat", "-o", "o"]);
+        assert!(err.contains("unknown option"), "{err}");
     }
 
     #[test]
@@ -383,10 +572,11 @@ mod tests {
         let cli = must_ok(&["list", "a.dat", "--threads=8"]);
         assert_eq!(cli.threads, 8);
         // -j8
-        let cli = must_ok(&["-j8", "list", "a.dat"]);
+        let cli = must_ok(&["-j8", "a.dat"]);
         assert_eq!(cli.threads, 8);
+        assert!(matches!(cli.command, Command::Drag { .. }));
         // --threads 8（子命令之後）
-        let cli = must_ok(&["extract", "a.dat", "out", "--threads", "4"]);
+        let cli = must_ok(&["extract", "a.dat", "--threads", "4"]);
         assert_eq!(cli.threads, 4);
     }
 
@@ -396,14 +586,9 @@ mod tests {
         assert!(cli.quiet);
         let cli = must_ok(&["list", "a.dat", "--quiet"]);
         assert!(cli.quiet);
-    }
-
-    #[test]
-    fn compat_single_and_double_positional() {
-        let cli = must_ok(&["a.dat"]);
-        assert!(matches!(cli.command, Command::List { .. }));
-        let cli = must_ok(&["a.dat", "out"]);
-        assert!(matches!(cli.command, Command::Extract { .. }));
+        let cli = must_ok(&["-q", "a.dat"]);
+        assert!(cli.quiet);
+        assert!(matches!(cli.command, Command::Drag { .. }));
     }
 
     #[test]
@@ -412,9 +597,13 @@ mod tests {
         assert!(matches!(cli.command, Command::Help));
         let cli = must_ok(&["--help"]);
         assert!(matches!(cli.command, Command::Help));
+        let cli = must_ok(&["help"]);
+        assert!(matches!(cli.command, Command::Help));
         let cli = must_ok(&["-V"]);
         assert!(matches!(cli.command, Command::Version));
         let cli = must_ok(&["--version"]);
+        assert!(matches!(cli.command, Command::Version));
+        let cli = must_ok(&["version"]);
         assert!(matches!(cli.command, Command::Version));
     }
 
@@ -422,15 +611,13 @@ mod tests {
     fn removed_options_fail_as_unknown() {
         // 已移除的選項不得靜默忽略，一律走未知選項錯誤。
         for v in [
-            vec!["extract", "a.dat", "out", "--dry-run"],
-            vec!["extract", "a.dat", "out", "--out=o"],
+            vec!["extract", "a.dat", "--dry-run"],
             vec!["list", "a.dat", "--dir", "d"],
             vec!["combine", "v.csv"],
             vec!["convert", "d"],
             vec!["info", "a.dat"],
             vec!["list", "a.dat", "--background", "none"],
             vec!["convert", "d", "--ffmpeg", "/bin/ffmpeg"],
-            vec!["combine", "v.csv", "-o", "o"],
             vec!["combine", "v.csv", "-d", "i"],
         ] {
             let err = must_err(&v);
@@ -450,8 +637,8 @@ mod tests {
         let err = must_err(&["list"]);
         assert!(err.contains("missing"), "{err}");
         assert!(err.contains("用法"), "{err}");
-        let err = must_err(&["extract", "a.dat"]);
-        assert!(err.contains("missing"), "{err}");
+        let err = must_err(&["extract", "a.dat", "extra"]);
+        assert!(err.contains("too many"), "{err}");
         let err = must_err(&[]);
         assert!(err.contains("missing"), "{err}");
     }
@@ -483,6 +670,21 @@ mod tests {
         assert!(err.contains("requires a value"), "{err}");
         let err = must_err(&["-j"]);
         assert!(err.contains("requires a value"), "{err}");
+        let err = must_err(&["extract", "a.dat", "--out"]);
+        assert!(err.contains("requires a value"), "{err}");
+        let err = must_err(&["extract", "a.dat", "-o"]);
+        assert!(err.contains("requires a value"), "{err}");
+    }
+
+    #[test]
+    fn summary_bytes_format() {
+        // 與進度條同規則：規格 §5.2 的取樣點。
+        assert_eq!(format_bytes(0), "0B");
+        assert_eq!(format_bytes(999), "999B");
+        assert_eq!(format_bytes(1024), "1K");
+        assert_eq!(format_bytes(1536), "1.5K");
+        assert_eq!(format_bytes(1024 * 1024), "1M");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3G");
     }
 
     #[test]

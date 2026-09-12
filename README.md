@@ -13,18 +13,33 @@ cargo build --release
 ## 用法
 
 ```
-aokana list <file.dat>            # 列出內容
-aokana extract <file.dat> <out>   # 解密後原樣寫出
+aokana <path>                      # 拖拽模式：見下
+aokana extract <path> [-o <dir>]   # 同上，可指定輸出根目錄
+aokana list <file.dat>             # 列出內容
 ```
 
 範例：
 
 ```
+aokana data.dat
+aokana extract data.dat -o ./out -j 4
 aokana list data.dat
-aokana extract data.dat ./out -j 4
 ```
 
-相容用法：`aokana <file.dat>` 等同 list，`aokana <file.dat> <out>` 等同 extract。`-j N` 指定執行緒數（0 表自動），`-q` 不輸出進度，`-h/--help` 顯示說明，`-V/--version` 顯示版本。
+### 拖拽模式
+
+把 `.dat` 拖到 `aokana.exe` 上，會在該 `.dat` 同目錄下建立同名資料夾並解到裡面
+（`X.dat` → `X/`，去掉 `.dat` 副檔名）；拖一個資料夾上去則遞迴解開其中所有 `.dat`。
+CLI 下 `aokana <path>` 與 `aokana extract <path> [-o <dir>]` 走完全相同的解包路徑，
+`-o` 指定輸出根目錄時會鏡射來源的相對結構，避免不同子目錄下的同名 `.dat` 互撞。
+
+進度條：解包時顯示單一進度條（含預估剩餘時間）；資料夾模式下是全部 `.dat`
+共用一條，不是每個 `.dat` 一條。輸出重導向到檔案或管線（非終端機）時自動停用。
+`-j N` 指定執行緒數（0 表自動），`-q` 不顯示進度與摘要，
+`-h/--help` 顯示說明，`-V/--version` 顯示版本。
+
+只有拖拽模式在失敗時會暫停等按鍵（避免總管視窗直接關閉、看不到錯誤）；
+明確子命令與非終端機（管線、CI）下不暫停。
 
 ## 與上游的差異
 

@@ -10,6 +10,7 @@ pub mod error;
 pub mod extract;
 pub mod pathsafe;
 pub mod pool;
+pub mod progress;
 pub mod sysio;
 
 // cri.rs 的 SIMD 核心。刻意不公開：外部只該看到 cri::decrypt_in_place。
