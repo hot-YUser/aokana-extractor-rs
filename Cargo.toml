@@ -1,10 +1,10 @@
 [package]
 name = "aokana-extractor"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.70"
 description = "Extract and decrypt Aokana Steam .dat archives"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 [lib]
 name = "aokana_extractor"

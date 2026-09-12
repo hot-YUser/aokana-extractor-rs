@@ -36,3 +36,7 @@ aokana extract data.dat ./out -j 4
 ## 為什麼是零依賴
 
 只用 `std`：位置讀取用 `FileExt::read_at` / `seek_read` 讓多執行緒共用一個 `File` 不需鎖；平行池用 `std::thread::scope`；SIMD 用 `core::arch` 加執行期偵測。
+
+## 授權
+
+AGPL-3.0-or-later，全文見 [LICENSE](LICENSE)。
