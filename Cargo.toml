@@ -1,0 +1,24 @@
+[package]
+name = "aokana-extractor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Extract and decrypt Aokana Steam .dat archives"
+license = "MIT"
+
+[lib]
+name = "aokana_extractor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aokana"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
