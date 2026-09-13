@@ -416,6 +416,8 @@ mod tests {
 
     /// 在記憶體組出最小合法 .dat（做法同 `dat.rs` 測試的組裝：entry 表與
     /// 名稱表各自加密、payload 各自加密，header 回填 wrapping 總和）。
+    /// 為什麼加密傳 Aokana：合成語料沿用原本常數（總和由位移 16 起算 251 項），
+    /// 即 Aokana 變體；若將來要測 EXTRA2 合成語料再另傳變體參數。
     fn build_dat(names: &[&str], payloads: &[Vec<u8>]) -> Vec<u8> {
         assert_eq!(names.len(), payloads.len());
         let entry_key = 0x11u32;
@@ -441,9 +443,9 @@ mod tests {
             off += p.len();
         }
         let mut et = table.clone();
-        crate::cri::encrypt_in_place(&mut et, entry_key);
+        crate::cri::encrypt_in_place(&mut et, entry_key, crate::cri::Variant::Aokana);
         let mut nt = name_table.clone();
-        crate::cri::encrypt_in_place(&mut nt, name_key);
+        crate::cri::encrypt_in_place(&mut nt, name_key, crate::cri::Variant::Aokana);
         // header：先放兩把金鑰，再回填最後一格使 wrapping 總和等於 N。
         let mut header = [0u8; crate::dat::HEADER_LEN];
         header[92..96].copy_from_slice(&name_key.to_le_bytes());
@@ -463,7 +465,7 @@ mod tests {
         for (i, p) in payloads.iter().enumerate() {
             let key = 0x1234_0000u32.wrapping_add(i as u32);
             let mut enc = p.clone();
-            crate::cri::encrypt_in_place(&mut enc, key);
+            crate::cri::encrypt_in_place(&mut enc, key, crate::cri::Variant::Aokana);
             out.extend_from_slice(&enc);
         }
         out
