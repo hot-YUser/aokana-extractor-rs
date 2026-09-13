@@ -10,6 +10,10 @@ const TICK_MS: u64 = 100;
 const BAR_WIDTH: usize = 28;
 /// `last_ms` 的初始值，表示「還沒渲染過」。
 const NEVER: u64 = u64::MAX;
+/// 渲染行的固定寬度。比最長可能內容（大約 66 字元）再寬一點，
+/// 且小於標準 80 欄主控台，避免換行。補空白是為了讓較短的行
+/// 在 `\r` 覆蓋後不會留下上一幀的殘字（用空白覆蓋掉）。
+const LINE_WIDTH: usize = 74;
 
 /// 跨執行緒共享的位元組進度。
 ///
@@ -37,17 +41,28 @@ impl Progress {
     }
 
     /// 工作執行緒回報完成 `bytes` 個位元組。
-    /// 以 `last_ms.swap(now)` 做速率限制：只有 swap 回傳的舊值距現在 >= TICK_MS
-    /// 的那一條執行緒會真的渲染（swap 是原子交換，所以同批只會有一條通過）。
+    /// 只有搶到渲染權的那條執行緒會真的渲染：時間戳只在畫了一幀時更新，
+    /// 因此同批呼叫只會有一條通過，不需要額外的渲染執行緒也不需要鎖。
     pub fn add(&self, bytes: u64) {
         if !self.enabled {
             return;
         }
         self.done.fetch_add(bytes, Ordering::Relaxed);
         let now = self.start.elapsed().as_millis() as u64;
-        let prev = self.last_ms.swap(now, Ordering::Relaxed);
-        // 首次呼叫（prev == NEVER）一定要畫一次，否則小檔案跑完都沒畫面。
-        if prev == NEVER || now.saturating_sub(prev) >= TICK_MS {
+        // 為什麼不是 swap：時間戳只能在「真的畫了一幀」時更新。若每次 add 都更新，
+        // 高頻的 add（每個 entry 只花幾毫秒）會讓時間戳一直被刷新，
+        // now - last 永遠到不了 TICK_MS，進度條就只畫得出第一幀與最後一幀。
+        let prev = self.last_ms.load(Ordering::Relaxed);
+        if prev != NEVER && now.saturating_sub(prev) < TICK_MS {
+            return;
+        }
+        // 搶渲染權：只有 CAS 成功的那條執行緒會畫。
+        // CAS 失敗代表別條執行緒剛搶到並已更新時間戳，這條就不必再畫。
+        if self
+            .last_ms
+            .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
             self.render();
         }
     }
@@ -104,11 +119,15 @@ fn format_line(total: u64, done: u64, elapsed: Duration) -> String {
     for _ in filled..BAR_WIDTH {
         bar.push('-');
     }
-    format!(
+    let mut s = format!(
         "[{bar}] {pct}%  {}/{}  ETA {eta}",
         fmt_bytes(done),
         fmt_bytes(total),
-    )
+    );
+    while s.len() < LINE_WIDTH {
+        s.push(' ');
+    }
+    s
 }
 
 /// 以 1024 為底：`>= 1 GiB` 用 `G`、`>= 1 MiB` 用 `M`、`>= 1 KiB` 用 `K`，
@@ -181,7 +200,7 @@ mod tests {
     fn full_bar_renders_at_full_percent() {
         let line = format_line(100, 100, Duration::from_secs(5));
         assert!(line.starts_with("[############################] 100% "));
-        assert!(line.ends_with("ETA 00:00"));
+        assert!(line.trim_end().ends_with("ETA 00:00"));
     }
 
     #[test]
